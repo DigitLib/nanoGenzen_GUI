@@ -1,0 +1,9 @@
+{
+  "vocab_size": 93,
+  "block_size": 256,
+  "n_layer": 6,
+  "n_head": 8,
+  "n_embd": 256,
+  "num_rules": 11,
+  "max_antecedents": 16
+}
