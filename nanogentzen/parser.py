@@ -1,36 +1,33 @@
 """
 nanogentzen/parser.py
 Compiles symbolic expressions and natural language deduction prompts
-into formal Gentzen Sequents with canonical variable mapping.
+into formal Gentzen Sequents.
 """
 
 import re
-from typing import Dict, List, Optional, Tuple
-
+from typing import List, Optional, Tuple
 from nanogentzen.kernel import And, Formula, Imp, Not, Or, Sequent, Var
 
 
 class FormulaParser:
-    """Recursive descent parser for propositional formulas."""
+    """Recursive descent parser for propositional formulas and sequents."""
 
-    def __init__(self, text: str) -> None:
-        normalized = (
+    def __init__(self, text: str):
+        text = (
             text.replace("⟶", "|-")
             .replace("⊢", "|-")
-            .replace("⟹", "=>")
             .replace("->", "=>")
-            .replace("→", "=>")
+            .replace("⇒", "=>")
+            .replace("⊃", "=>")
             .replace("∧", "&")
-            .replace("·", "&")
             .replace("∨", "|")
             .replace("¬", "~")
-            .replace("!", "~")
         )
-        self.tokens: List[str] = self._tokenize(normalized)
-        self.pos: int = 0
+        self.raw_text = text
+        self.tokens = self._tokenize(text)
+        self.pos = 0
 
-    @staticmethod
-    def _tokenize(text: str) -> List[str]:
+    def _tokenize(self, text: str) -> List[str]:
         token_spec = [
             ("TURNSTILE", r"\|-"),
             ("LPAREN", r"\("),
@@ -40,12 +37,12 @@ class FormulaParser:
             ("OR", r"\||\bor\b"),
             ("NOT", r"~|\bnot\b"),
             ("COMMA", r","),
-            ("ZERO", r"\b0\b|\bfalse\b|\bbot\b|\bbottom\b"),
+            ("ZERO", r"\b0\b|\bfalse\b|\bBOT\b"),
             ("VAR", r"[A-Za-z_][A-Za-z0-9_]*"),
             ("SKIP", r"\s+"),
         ]
         tok_regex = "|".join(f"(?P<{pair[0]}>{pair[1]})" for pair in token_spec)
-        tokens: List[str] = []
+        tokens = []
         for mo in re.finditer(tok_regex, text, re.IGNORECASE):
             kind = mo.lastgroup
             val = mo.group()
@@ -61,8 +58,6 @@ class FormulaParser:
                 tokens.append("=>")
             elif kind == "TURNSTILE":
                 tokens.append("|-")
-            elif kind == "ZERO":
-                tokens.append("0")
             else:
                 tokens.append(val)
         return tokens
@@ -72,22 +67,24 @@ class FormulaParser:
 
     def _consume(self, expected: Optional[str] = None) -> str:
         if self.pos >= len(self.tokens):
-            exp_str = expected if expected is not None else "token"
-            raise ValueError(f"Unexpected end of input, expected '{exp_str}'")
+            raise ValueError(f"Unexpected end of input, expected {expected}")
         tok = self.tokens[self.pos]
-        if expected is not None and tok != expected:
-            raise ValueError(f"Expected '{expected}', got '{tok}' at token index {self.pos}")
+        if expected and tok != expected:
+            raise ValueError(f"Expected '{expected}', got '{tok}' at position {self.pos}")
         self.pos += 1
         return tok
 
     def parse_sequent(self) -> Sequent:
-        """Parses Gamma |- Delta"""
+        if "|-" not in self.tokens:
+            goal_formula = self.parse_formula()
+            return Sequent((), (goal_formula,))
+
         gamma: List[Formula] = []
         delta: List[Formula] = []
 
         if self._peek() and self._peek() != "|-":
             while True:
-                if self._peek() == "0":
+                if self._peek() in ("0", "false", "BOT"):
                     self._consume()
                 else:
                     gamma.append(self.parse_formula())
@@ -98,11 +95,9 @@ class FormulaParser:
 
         if self._peek() == "|-":
             self._consume("|-")
-        elif not gamma and not self._peek():
-            raise ValueError("Empty sequent")
 
         if self._peek():
-            if self._peek() == "0":
+            if self._peek() in ("0", "false", "BOT"):
                 self._consume()
             else:
                 while self._peek():
@@ -156,231 +151,137 @@ class FormulaParser:
             return expr
         elif tok and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", tok):
             self._consume()
-            if tok in ("0", "bot", "bottom", "false"):
-                return Var("0")
             return Var(tok)
         raise ValueError(f"Unexpected token in formula: {tok}")
 
 
-# =====================================================================
-# ALPHA-CANONICALIZER (Maps arbitrary atom names to P, Q, R, ...)
-# =====================================================================
-
-CANONICAL_VARS: List[str] = ["P", "Q", "R", "S", "T", "U", "V", "W", "A", "B", "C", "D"]
-
-
-def canonicalize_formula(f: Formula, var_map: Dict[str, str]) -> Formula:
-    """Recursively converts variables to canonical single-letter names."""
-    if isinstance(f, Var):
-        if f.name in ("0", "bot", "bottom", "false"):
-            return Var("0")
-        if f.name not in var_map:
-            next_var = CANONICAL_VARS[len(var_map) % len(CANONICAL_VARS)]
-            var_map[f.name] = next_var
-        return Var(var_map[f.name])
-    elif isinstance(f, Not):
-        return Not(canonicalize_formula(f.inner, var_map))
-    elif isinstance(f, Imp):
-        return Imp(canonicalize_formula(f.left, var_map), canonicalize_formula(f.right, var_map))
-    elif isinstance(f, And):
-        return And(canonicalize_formula(f.left, var_map), canonicalize_formula(f.right, var_map))
-    elif isinstance(f, Or):
-        return Or(canonicalize_formula(f.left, var_map), canonicalize_formula(f.right, var_map))
-    return f
-
-
-def canonicalize_sequent(seq: Sequent) -> Sequent:
-    """Canonicalizes all variable names across Gamma and Delta in a Sequent."""
-    var_map: Dict[str, str] = {}
-    new_gamma = tuple(canonicalize_formula(f, var_map) for f in seq.gamma)
-    new_delta = tuple(canonicalize_formula(f, var_map) for f in seq.delta)
-    return Sequent(new_gamma, new_delta)
-
-
 def parse_symbolic_sequent(text: str) -> Optional[Sequent]:
-    """Tries to parse a symbolic sequent like '(P => Q), ~Q |- ~P'."""
-    if not any(sym in text for sym in ["|-", "⟶", "⊢", "=>", "->", "&", "|", "~"]):
-        return None
     try:
         parser = FormulaParser(text)
         seq = parser.parse_sequent()
         if parser.pos < len(parser.tokens):
             return None
-        return canonicalize_sequent(seq)
-    except (ValueError, TypeError, IndexError, KeyError, AttributeError):
+        return seq
+    except Exception:
         return None
 
 
-# =====================================================================
-# NATURAL LANGUAGE DECOMPOSITION ENGINE
-# =====================================================================
-
 def normalize_word(w: str) -> str:
-    w = w.lower()
-    if w in {
-        "is", "are", "in", "the", "a", "an", "it", "did", "do", "does",
-        "were", "was", "then", "of", "to", "there", "that", "this"
-    }:
+    low = w.lower()
+    # If the token is a single variable letter (e.g., A, P, X), do not drop it as a stopword
+    if len(w) == 1 and w.isalpha():
+        return w.upper()
+
+    stopwords = {
+        "is", "are", "in", "the", "an", "it", "did", "do", "does",
+        "were", "was", "then", "of", "to", "there", "should", "could",
+        "would", "can", "will", "shall", "must", "may", "might", "a"
+    }
+    if low in stopwords:
         return ""
-    if w.endswith("ing") and len(w) > 4:
-        w = w[:-3]
-    elif w.endswith("ed") and len(w) > 3:
-        w = w[:-2]
-    elif w.endswith("es") and len(w) > 3:
-        w = w[:-2]
-    elif w.endswith("s") and len(w) > 2 and not w.endswith("ss"):
-        w = w[:-1]
-    return w.capitalize()
+    if low.endswith("ing") and len(low) > 4:
+        low = low[:-3]
+    elif low.endswith("ed") and len(low) > 3:
+        low = low[:-2]
+    elif low.endswith("es") and len(low) > 3:
+        low = low[:-2]
+    elif low.endswith("s") and len(low) > 2 and not low.endswith("ss"):
+        low = low[:-1]
+    return low.capitalize()
 
 
-def clean_term(phrase: str) -> Var:
-    """Cleans a natural language phrase into a consistent PascalCase variable."""
-    words = [normalize_word(w) for w in re.findall(r"[A-Za-z0-9]+", phrase)]
+def clean_term(phrase: str) -> Formula:
+    raw_tokens = re.findall(r"[A-Za-z0-9]+", phrase)
+    if not raw_tokens:
+        return Var("X")
+    if len(raw_tokens) == 1 and len(raw_tokens[0]) == 1:
+        return Var(raw_tokens[0].upper())
+
+    words = [normalize_word(w) for w in raw_tokens]
     words = [w for w in words if w]
     name = "".join(words)
-    return Var(name if name else "X")
+    return Var(name if name else raw_tokens[0].capitalize())
+
+
+def parse_nl_formula(phrase: str) -> Formula:
+    """Recursively splits natural language sub-clauses on 'or', 'and', and 'not'."""
+    phrase = phrase.strip()
+
+    # 1. OR split
+    or_parts = re.split(r"\bor\b|\|", phrase, maxsplit=1, flags=re.IGNORECASE)
+    if len(or_parts) == 2 and or_parts[0].strip() and or_parts[1].strip():
+        return Or(parse_nl_formula(or_parts[0]), parse_nl_formula(or_parts[1]))
+
+    # 2. AND split
+    and_parts = re.split(r"\band\b|&", phrase, maxsplit=1, flags=re.IGNORECASE)
+    if len(and_parts) == 2 and and_parts[0].strip() and and_parts[1].strip():
+        return And(parse_nl_formula(and_parts[0]), parse_nl_formula(and_parts[1]))
+
+    # 3. NOT prefix
+    if re.match(r"^(?:not\s+|~\s*|it\s+is\s+not\s+(?:the\s+case\s+that\s+)?)", phrase, re.IGNORECASE):
+        core = re.sub(r"^(?:not\s+|~\s*|it\s+is\s+not\s+(?:the\s+case\s+that\s+)?)", "", phrase, flags=re.IGNORECASE)
+        return Not(parse_nl_formula(core))
+
+    return clean_term(phrase)
 
 
 def parse_natural_language(text: str) -> Optional[Tuple[Sequent, str]]:
-    """Translates natural language syllogisms, implications, and queries into sequents."""
     text_clean = text.strip()
-
-    # 1. Explicit Turnstile / Formal Sequent block
-    seq_match = re.search(
-        r"Formal Sequent:\s*([A-Za-z0-9_~()\s,=&|>\-⟶⊢⟹∧∨¬]+)",
-        text_clean,
-        re.IGNORECASE,
-    )
-    if seq_match:
-        cand = seq_match.group(1).split("\n")[0].strip()
-        seq = parse_symbolic_sequent(cand)
-        if seq is not None:
-            return seq, "Extracted explicit formal sequent"
-
-    # Split into discrete sentences
     sentences = [s.strip() for s in re.split(r"[.!?\n]+", text_clean) if s.strip()]
     if not sentences:
         return None
 
-    # 2. Strict Single-Sentence Conditionals: ONLY when len(sentences) == 1
-    if len(sentences) == 1 and text_clean.lower().startswith("if "):
-        match_single_if = re.search(
-            r"^if\s+([^,]+?)[,\s]+(?:can\s+we\s+conclude\s+(?:that)?|does\s+(?:that|it)\s+mean\s+(?:that)?|does\s+it\s+follow\s+(?:that)?|do\s+i|can\s+we|does\s+that|is\s+it|will\s+i|would\s+it|can\s+i|did\s+it|is\s+there)\s+(.+?)\??$",
-            text_clean,
-            flags=re.IGNORECASE,
-        )
-        if match_single_if:
-            p_raw, c_raw = match_single_if.groups()
-            p_var = clean_term(p_raw)
-            c_var = clean_term(c_raw)
-            raw_seq = Sequent((p_var,), (c_var,))
-            return canonicalize_sequent(raw_seq), f"Conditional entailment: {p_var.to_str()} ⟶ {c_var.to_str()}"
-
-        match_if_comma = re.search(
-            r"^if\s+([^,]+?)\s*,\s*(.+?)\??$",
-            text_clean,
-            flags=re.IGNORECASE,
-        )
-        if match_if_comma:
-            p_raw, c_raw = match_if_comma.groups()
-            p_var = clean_term(p_raw)
-            c_var = clean_term(c_raw)
-            raw_seq = Sequent((p_var,), (c_var,))
-            return canonicalize_sequent(raw_seq), f"Conditional inquiry: {p_var.to_str()} ⟶ {c_var.to_str()}"
-
-    # 3. Multi-Sentence Syllogism & Modus Tollens/Ponens Decomposition
     has_q = "?" in text_clean
     target_q = sentences[-1]
     premise_sentences = sentences[:-1] if (has_q or len(sentences) > 1) else sentences
 
     premises: List[Formula] = []
 
+    # Regex matching common natural language conditional triggers
+    cond_pattern = re.compile(
+        r"^(?:if|assuming|suppose|supposing|given\s+that|given|whenever|when|provided\s+that|provided)\s+",
+        re.IGNORECASE,
+    )
+
     for s in premise_sentences:
         lower_s = s.lower().strip()
 
-        # 3a. Implication: "If A then B" / "If A, B"
-        if lower_s.startswith("if "):
-            content = s[3:].strip()
+        # 1. Conditionals: 'if', 'assuming', 'suppose', 'given', 'whenever' ...
+        if cond_pattern.match(lower_s):
+            content = cond_pattern.sub("", s).strip()
             parts = re.split(r"\bthen\b|,", content, maxsplit=1)
-            if len(parts) == 2:
-                premises.append(Imp(clean_term(parts[0]), clean_term(parts[1])))
-                continue
-            parts_in = re.split(r"\bis\s+in\b|\bis\b", content, maxsplit=1, flags=re.IGNORECASE)
-            if len(parts_in) == 2:
-                premises.append(Imp(clean_term(parts_in[0]), clean_term(parts_in[1])))
+            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                premises.append(Imp(parse_nl_formula(parts[0]), parse_nl_formula(parts[1])))
                 continue
 
-        # 3b. "In X, Y" (e.g. "In Spring, flowers blooming")
-        if lower_s.startswith("in "):
-            content = s[3:].strip()
-            parts = re.split(r",|\bare\b|\bis\b", content, maxsplit=1, flags=re.IGNORECASE)
-            if len(parts) == 2:
-                premises.append(Imp(clean_term(parts[0]), clean_term(parts[1])))
-                continue
-            words = content.split(maxsplit=1)
-            if len(words) == 2:
-                premises.append(Imp(clean_term(words[0]), clean_term(words[1])))
-                continue
-
-        # 3c. "X implies Y" / "X leads to Y" / "X means Y"
+        # 2. Infix implication: "X implies Y", "X leads to Y", "X means Y"
         match_imp = re.split(r"\bimplies\b|\bleads to\b|\bmeans\b", s, maxsplit=1, flags=re.IGNORECASE)
-        if len(match_imp) == 2:
-            premises.append(Imp(clean_term(match_imp[0]), clean_term(match_imp[1])))
+        if len(match_imp) == 2 and match_imp[0].strip() and match_imp[1].strip():
+            premises.append(Imp(parse_nl_formula(match_imp[0]), parse_nl_formula(match_imp[1])))
             continue
 
-        # 3d. Negation: "Not X" / "The street is not wet"
-        if lower_s.startswith("not ") or " not " in lower_s or "didn't" in lower_s or "no " in lower_s or "isn't" in lower_s or "isnt" in lower_s:
-            core = re.sub(r"\bnot\b|\bdid not\b|\bdidn't\b|\bis not\b|\bisn't\b|\bisnt\b|\bno\b", "", s, flags=re.IGNORECASE)
-            premises.append(Not(clean_term(core)))
-            continue
+        premises.append(parse_nl_formula(s))
 
-        # 3e. Simple Assertion: "X is in Y" -> X => Y
-        parts_is = re.split(r"\bis\s+in\b", s, maxsplit=1, flags=re.IGNORECASE)
-        if len(parts_is) == 2:
-            premises.append(Imp(clean_term(parts_is[0]), clean_term(parts_is[1])))
-            continue
+    # --- Parse Goal from target_q ---
+    q_lower = target_q.lower().strip()
 
-        premises.append(clean_term(s))
-
-    # Parse Goal from target_q
-    q_lower = target_q.lower()
-    match_q_in = re.search(r"\b(?:are|is|do|did)\s+(.+?)\s+in\s+([a-zA-Z0-9]+)", target_q, re.IGNORECASE)
-    if match_q_in:
-        property_term = clean_term(match_q_in.group(1))
-        subject_term = clean_term(match_q_in.group(2))
-        goal: Formula = Imp(subject_term, property_term)
-    elif "not " in q_lower or "didn't" in q_lower:
-        core = re.sub(r"\b(?:are|is|did|do|was|were)\s+|\bnot\b|\?", "", target_q, flags=re.IGNORECASE)
-        goal = Not(clean_term(core))
+    # Infix conditional goal: "Is it B if A?"
+    if " if " in q_lower:
+        consequent_part, antecedent_part = re.split(r"\bif\b", target_q, maxsplit=1, flags=re.IGNORECASE)
+        goal = Imp(parse_nl_formula(antecedent_part), parse_nl_formula(consequent_part))
+    # Prefix conditional goal: "Assuming A, is it B?" / "If A, then B?"
+    elif cond_pattern.match(q_lower):
+        content = cond_pattern.sub("", target_q).strip()
+        parts = re.split(r"\bthen\b|,", content, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            goal = Imp(parse_nl_formula(parts[0]), parse_nl_formula(parts[1]))
+        else:
+            goal = parse_nl_formula(target_q)
     else:
-        goal = clean_term(target_q)
+        # Strip question prefix like 'Is', 'Does', 'Should'
+        core_q = re.sub(r"^(?:is|are|does|do|should|can|could|would)\s+", "", target_q, flags=re.IGNORECASE)
+        goal = parse_nl_formula(core_q)
 
-    # 4. Modus Tollens Inversion Handler:
-    # If premises contain (P => Q) and ~Q, and the query asks about P, the target is ~P
-    if isinstance(goal, Var):
-        for p in premises:
-            if isinstance(p, Imp):
-                # Check if negated consequent ~Q exists in premises
-                has_neg_consequent = any(
-                    isinstance(prem, Not) and (
-                        prem.inner.to_str() == p.right.to_str()
-                        or prem.inner.to_str() in p.right.to_str()
-                        or p.right.to_str() in prem.inner.to_str()
-                    )
-                    for prem in premises
-                )
-                # If antecedent P matches query goal, target is ~P
-                if has_neg_consequent:
-                    if (
-                        goal.to_str() == p.left.to_str()
-                        or goal.to_str() in p.left.to_str()
-                        or p.left.to_str() in goal.to_str()
-                    ):
-                        goal = Not(p.left)
-                        break
-
-    raw_seq = Sequent(tuple(premises), (goal,))
-    canon_seq = canonicalize_sequent(raw_seq)
-    goal_str = goal.to_str() if hasattr(goal, "to_str") else str(goal)
-    desc = f"Extracted {len(premises)} premise(s) ⟶ Goal: {goal_str}"
-    return canon_seq, desc
+    seq = Sequent(tuple(premises), (goal,))
+    desc = f"Extracted {len(premises)} premise(s) ⟶ Goal: {goal.to_str()}"
+    return seq, desc
